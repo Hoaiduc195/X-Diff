@@ -1055,7 +1055,11 @@ def _shown(root):
 
 
 def _report_zoom(main, x_range, y_range):
-    """Report a pan/zoom as a browser does: through the RangeXY callback HoloViews puts on the map."""
+    """Report a pan/zoom to the map's RangeXY stream, as HoloViews does once the browser's event arrives.
+
+    The message goes to the callback of a separate plot of the same map, which shares its
+    streams, not through the served figure's own event handling.
+    """
     import asyncio
 
     import holoviews as hv
@@ -1072,7 +1076,10 @@ def _report_zoom(main, x_range, y_range):
     assert callbacks, "the difference map does not listen to pans/zooms"
     message = {"x0": x_range[0], "x1": x_range[1], "y0": y_range[0], "y1": y_range[1]}
     for callback in callbacks:
-        asyncio.run(callback.on_msg(message))
+        handled = callback.on_msg(message)
+        # on_msg is a coroutine from holoviews 1.20; 1.19 (the lower bound) handles the message synchronously.
+        if asyncio.iscoroutine(handled):
+            asyncio.run(handled)
 
 
 def test_live_map_keeps_the_zoom_across_depth_toggle_and_variable_changes():
