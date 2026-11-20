@@ -210,6 +210,45 @@ def test_compare_variables_does_not_wrap_around_on_unsigned_integers():
     assert result.relative_error == pytest.approx(2 / 12)
 
 
+@pytest.mark.parametrize(
+    ("comparison_values", "passed", "description", "note"),
+    [
+        ([True, False, True], True, "-", "equality only"),
+        ([True, True, True], False, "1 of 3 values differ", ""),
+    ],
+)
+def test_compare_variables_compares_booleans_for_equality(comparison_values, passed, description, note):
+    # numpy refuses to subtract booleans, so identical flags used to fail with its error.
+    reference = make_data_array([True, False, True], dtype=bool)
+    comparison = make_data_array(comparison_values, dtype=bool)
+
+    result = compare_variables(reference, comparison, "flag", last_time_step=False)
+
+    assert (result.passed, result.description, result.note) == (passed, description, note)
+    assert result.mask_equal
+
+
+@pytest.mark.parametrize(("value", "passed"), [(True, True), (False, False)])
+def test_compare_variables_compares_a_scalar_boolean(value, passed):
+    result = compare_variables(
+        make_data_array(True, dims=(), dtype=bool),
+        make_data_array(value, dims=(), dtype=bool),
+        "flag",
+        last_time_step=False,
+    )
+
+    assert result.passed is passed
+    assert result.description == ("-" if passed else "1 of 1 values differ")
+
+
+def test_compare_variables_fails_on_booleans_against_integers():
+    reference = make_data_array([True, False], dtype=bool)
+    comparison = make_data_array([1, 0], dtype="int8")
+
+    with pytest.raises(ValueError, match="bool"):
+        compare_variables(reference, comparison, "flag", last_time_step=False)
+
+
 def test_compare_variables_rejects_time_variables_when_last_time_step_is_enabled():
     reference = make_data_array(
         ["2024-01-01T00:00:00", "2024-01-02T00:00:00"],
@@ -460,8 +499,8 @@ def test_compare_variables_compares_other_objects_for_equality():
 
 @pytest.mark.parametrize(("comparison_dtype", "passed"), [(str, True), (bytes, False)], ids=["str", "bytes"])
 def test_compare_files_text_with_a_bounding_box(tmp_path, comparison_dtype, passed):
-    # A curvilinear crop masks with where(), which turns text into object arrays on both
-    # sides: str must still match str, and bytes must still fail against str.
+    # A curvilinear crop leaves text as it is (masking would turn it into object arrays):
+    # str must still match str, and bytes must still fail against str.
     labels = np.full((3, 4), "a")
     reference = _nemo_grid().assign(label=(("y", "x"), labels.astype(str)))
     comparison = _nemo_grid().assign(label=(("y", "x"), labels.astype(comparison_dtype)))
@@ -473,7 +512,7 @@ def test_compare_files_text_with_a_bounding_box(tmp_path, comparison_dtype, pass
 
     assert result.passed is passed
     if not passed:
-        assert result.description == "Data type mismatch: 'object (str)' - 'object (bytes)'"
+        assert result.description == "Data type mismatch: '<U1' - '|S1'"
 
 
 def test_compare_files_compares_a_text_variable_named_with_v(tmp_path):
@@ -487,12 +526,17 @@ def test_compare_files_compares_a_text_variable_named_with_v(tmp_path):
     assert [(result.variable, result.description) for result in results] == [("label", "1 of 2 values differ")]
 
 
-def test_compare_variables_fails_on_bytes_against_str():
-    reference = make_data_array([b"a", b"b"])
-    comparison = make_data_array(["a", "b"])
+@pytest.mark.parametrize("dtype", [None, object], ids=["text", "object"])
+def test_compare_variables_fails_on_bytes_against_str(dtype):
+    # Also when both are held in object arrays, as xarray reads text with a _FillValue.
+    reference = make_data_array([b"a", b"b"], dtype=dtype)
+    comparison = make_data_array(["a", "b"], dtype=dtype)
 
-    with pytest.raises(ValueError, match="Data type mismatch"):
+    with pytest.raises(ValueError, match="Data type mismatch") as error:
         compare_variables(reference, comparison, "label", last_time_step=False)
+
+    if dtype is object:
+        assert "'object (bytes)' - 'object (str)'" in str(error.value)
 
 
 def test_compare_variables_counts_a_value_missing_on_both_sides_as_equal():
@@ -693,6 +737,24 @@ def test_compare_files_explicit_selection_ignores_names_outside_it(tmp_path):
 
     assert [result.variable for result in results] == ["temp"]
     assert results[0].passed
+
+
+@pytest.mark.parametrize("variables", [None, [("flag", "flag")]])
+@pytest.mark.parametrize("last_time_step", [False, True])
+def test_compare_files_compares_boolean_variables(tmp_path, variables, last_time_step):
+    # netCDF has no bool type: xarray stores it as int8 with a dtype attribute and decodes it back.
+    def dataset(last_flags):
+        return xr.Dataset({"flag": (("time", "x"), [[True, True, False], last_flags])})
+
+    reference_path = write_dataset(tmp_path, "reference.nc", dataset([True, False, True]))
+    same_path = write_dataset(tmp_path, "same.nc", dataset([True, False, True]))
+    changed_path = write_dataset(tmp_path, "changed.nc", dataset([False, False, True]))
+
+    same = _by_variable(compare_files(reference_path, same_path, variables, last_time_step=last_time_step))
+    changed = _by_variable(compare_files(reference_path, changed_path, variables, last_time_step=last_time_step))
+
+    assert same["flag"].passed and same["flag"].note == "equality only"
+    assert changed["flag"].description == ("1 of 3 values differ" if last_time_step else "1 of 6 values differ")
 
 
 def _compare_selection(tmp_path, reference, comparison, variables, *, last_time_step=False):
@@ -1011,6 +1073,81 @@ def test_crop_to_bbox_curvilinear_grid():
     cropped = crop_to_bbox(dataset, BoundingBox(lon_min=2, lon_max=5, lat_min=2, lat_max=5))
 
     assert dict(cropped.sizes) == {"y": 4, "x": 4}
+
+
+def _rotated_grid():
+    """A 7x7 curvilinear grid turned so that a lon/lat box does not fill its index rectangle."""
+    xs, ys = np.meshgrid(np.arange(-3.0, 4.0), np.arange(-3.0, 4.0))
+    return xr.Dataset(
+        {
+            "sst": (("y", "x"), np.ones((7, 7), dtype="float32")),
+            "count": (("y", "x"), np.ones((7, 7), dtype="int32")),
+            "flag": (("y", "x"), np.zeros((7, 7), dtype=bool)),
+            "label": ("y", np.array(list("abcdefg"))),
+            "bounds": (("t", "nb"), np.zeros((2, 2))),
+        },
+        coords={"nav_lon": (("y", "x"), xs + 0.5 * ys), "nav_lat": (("y", "x"), ys)},
+    )
+
+
+ROTATED_BOX = BoundingBox(lon_min=-1.2, lon_max=1.2, lat_min=-1.2, lat_max=1.2)
+
+
+def test_crop_to_bbox_curvilinear_keeps_data_types_and_layout():
+    dataset = _rotated_grid()
+
+    cropped = crop_to_bbox(dataset, ROTATED_BOX)
+
+    # Every variable keeps its data type and dimensions; Dataset.where used to turn
+    # integers and booleans into floats, text into objects, and to broadcast a variable
+    # that is not on the grid ("bounds", "label") onto it.
+    assert {name: (variable.dims, variable.dtype) for name, variable in cropped.variables.items()} == {
+        name: (variable.dims, variable.dtype) for name, variable in dataset.variables.items()
+    }
+    assert dict(cropped.sizes) == {"y": 3, "x": 3, "t": 2, "nb": 2}
+    # Only the float field is masked outside the box; the others keep the whole rectangle.
+    inside = (np.abs(cropped["nav_lon"]) <= 1.2) & (np.abs(cropped["nav_lat"]) <= 1.2)
+    assert not bool(inside.all())
+    np.testing.assert_array_equal(cropped["sst"].notnull().values, inside.values)
+    assert int(cropped["count"].sum()) == 9
+    assert list(cropped["label"].values) == ["c", "d", "e"]
+
+
+@pytest.mark.parametrize(
+    ("comparison_flag", "description"),
+    [
+        (np.zeros((7, 7), dtype=bool), "-"),
+        (np.eye(7, dtype=bool), "3 of 9 values differ"),
+        (np.zeros((7, 7)), "Data type mismatch: 'bool' - 'float64'"),
+        (np.zeros((7, 7), dtype="int8"), "Data type mismatch: 'bool' - 'int8'"),
+    ],
+    ids=["same", "changed", "float", "int8"],
+)
+def test_compare_files_booleans_with_a_curvilinear_bounding_box(tmp_path, comparison_flag, description):
+    # The crop used to turn booleans into floats: no "equality only" or count of the
+    # values that differ, and booleans against floats of the same values passed.
+    reference_path = write_dataset(tmp_path, "reference.nc", _rotated_grid())
+    comparison_path = write_dataset(
+        tmp_path, "comparison.nc", _rotated_grid().assign(flag=(("y", "x"), comparison_flag))
+    )
+
+    flag = _by_variable(compare_files(reference_path, comparison_path, None, last_time_step=False, bbox=ROTATED_BOX))[
+        "flag"
+    ]
+
+    assert flag.description == description
+    assert flag.note == ("equality only" if description == "-" else "")
+
+
+def test_compare_files_integers_against_floats_with_a_curvilinear_bounding_box(tmp_path):
+    reference_path = write_dataset(tmp_path, "reference.nc", _rotated_grid())
+    comparison = _rotated_grid().assign(count=(("y", "x"), np.ones((7, 7))))
+    comparison_path = write_dataset(tmp_path, "comparison.nc", comparison)
+
+    results = _by_variable(compare_files(reference_path, comparison_path, None, last_time_step=False, bbox=ROTATED_BOX))
+
+    # It used to pass: the crop turned both into float64.
+    assert results["count"].description == "Data type mismatch: 'int32' - 'float64'"
 
 
 def test_crop_to_bbox_one_dimensional_auxiliary_coordinates():

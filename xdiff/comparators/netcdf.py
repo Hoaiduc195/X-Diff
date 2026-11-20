@@ -108,8 +108,8 @@ def compare_all_variables(
     Rows come in this order:
 
     1. every variable of the reference (data variables, then dimension and auxiliary
-       coordinates) that the comparison also has, compared by value (text and cftime
-       dates for equality, see ``compare_variables``);
+       coordinates) that the comparison also has, compared by value (text, cftime
+       dates and booleans for equality, see ``compare_variables``);
     2. every dimension without a coordinate variable in both datasets, compared by size;
     3. every variable, then every dimension without a coordinate variable, found in only
        one of the datasets, as a failure that names the side it is in.
@@ -188,9 +188,9 @@ def _value_kind(field: xr.DataArray) -> str | None:
     """What a text or object array holds: ``str``, ``bytes``, ``cftime <calendar>`` or ``object``.
 
     None for any other dtype, without loading the values. xarray reads text as an object
-    array when it has a ``_FillValue`` or after ``--bbox`` masked it, so an object array is
-    classified by its first value that is not missing; ``object`` when all are missing or
-    the value is of another type.
+    array when it has a ``_FillValue``, so an object array is classified by its first
+    value that is not missing; ``object`` when all are missing or the value is of another
+    type.
     """
     kind = field.dtype.kind
     if kind == "U":
@@ -222,7 +222,7 @@ EQUALITY_ONLY = "equality only"
 
 
 def compare_for_equality(reference_values: np.ndarray, comparison_values: np.ndarray, variable: str) -> CompareResult:
-    """Compare values that have no numeric difference (text, cftime dates) one by one.
+    """Compare values that have no numeric difference (text, cftime dates, booleans) one by one.
 
     A value missing on both sides (None or NaN in an object array) counts as equal. The
     two arrays must have the same shape.
@@ -356,15 +356,39 @@ def _oriented_slice(coordinate: xr.DataArray, low: float, high: float) -> slice:
     return slice(low, high)
 
 
+# Data types that hold a missing value (NaN, NaT) without changing: float, complex, dates, durations.
+_MASKABLE_KINDS = "fcmM"
+
+
 def _crop_curvilinear(dataset: xr.Dataset, longitude: xr.DataArray, latitude: xr.DataArray, bbox: BoundingBox):
-    """Crop a 2-D (curvilinear) grid, e.g. NEMO nav_lon/nav_lat, by masking and dropping."""
+    """Crop a 2-D (curvilinear) grid, e.g. NEMO nav_lon/nav_lat, or 1-D auxiliary lon/lat.
+
+    Keeps the smallest index rectangle that holds the box, then masks the points of that
+    rectangle outside the box, on the data variables that use the grid's dimensions and
+    can hold a missing value. Other variables keep their data type and are compared over
+    the whole rectangle: masking would turn integers and booleans into floats and text
+    into objects. Variables that do not use the grid's dimensions are left as they are
+    (``Dataset.where`` would broadcast them onto the grid).
+    """
     inside_box = (
         (longitude >= bbox.lon_min)
         & (longitude <= bbox.lon_max)
         & (latitude >= bbox.lat_min)
         & (latitude <= bbox.lat_max)
     )
-    return dataset.where(inside_box, drop=True)
+    rectangle = {}
+    for dim in inside_box.dims:
+        other_dims = [other for other in inside_box.dims if other != dim]
+        holds_box = inside_box.any(dim=other_dims) if other_dims else inside_box
+        rectangle[dim] = np.flatnonzero(holds_box.values)
+    cropped = dataset.isel(rectangle)
+    inside_rectangle = inside_box.isel(rectangle)
+    masked = {
+        name: variable.where(inside_rectangle)
+        for name, variable in cropped.data_vars.items()
+        if variable.dtype.kind in _MASKABLE_KINDS and set(inside_rectangle.dims) <= set(variable.dims)
+    }
+    return cropped.assign(masked)
 
 
 def _as_variable_pair(item: str | tuple[str, str]) -> tuple[str, str]:
@@ -485,8 +509,9 @@ def compare_variables(
 
     validate_matching_metadata(ref_da, cmp_da)
 
-    if is_text_or_object(ref_da):
-        # Both sides hold text or objects (the data type check above makes sure).
+    if is_text_or_object(ref_da) or ref_da.dtype == np.bool_:
+        # Both sides hold text or objects, or both booleans (the data type check above makes
+        # sure). Neither has a numeric difference, and numpy refuses to subtract booleans.
         return compare_for_equality(ref_da.values, cmp_da.values, variable)
 
     reference_values = ref_da.values

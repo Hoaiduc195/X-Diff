@@ -430,3 +430,24 @@ def test_plot_passes_the_scale_to_the_static_renderer(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     assert captured == {"scale": "log"}
+
+
+@pytest.mark.parametrize(
+    ("comparison_flags", "exit_code", "text"),
+    [([True, False, True], 0, "equality only"), ([True, True, True], 1, "1 of 3 values differ")],
+)
+def test_files_compares_boolean_variables(tmp_path, comparison_flags, exit_code, text):
+    import xarray as xr
+
+    xr.Dataset({"flag": ("x", [True, False, True])}).to_netcdf(tmp_path / "ref.nc")
+    xr.Dataset({"flag": ("x", comparison_flags)}).to_netcdf(tmp_path / "cmp.nc")
+
+    result = CliRunner().invoke(
+        cli,
+        ["files", str(tmp_path / "ref.nc"), str(tmp_path / "cmp.nc"), "--no-progress"],
+        env={"COLUMNS": "200"},  # keep the table cells on one line
+    )
+
+    # Identical flags used to fail with numpy's "boolean subtract is not supported", exit 1.
+    assert result.exit_code == exit_code
+    assert text in result.output
