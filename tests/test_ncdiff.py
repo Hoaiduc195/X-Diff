@@ -1,3 +1,4 @@
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -89,23 +90,194 @@ def test_select_last_time_step_uses_named_time_dimension_when_not_first():
 
 def test_compute_relative_error_returns_zero_for_identical_arrays():
     diff = np.array([0.0, 0.0])
-    field = np.array([2.0, 4.0])
+    reference = np.array([2.0, 4.0])
 
-    assert compute_relative_error(diff, field) == 0.0
-
-
-def test_compute_relative_error_handles_division_by_zero():
-    diff = np.array([1.0, 0.0])
-    field = np.array([0.0, 2.0])
-
-    assert compute_relative_error(diff, field) == 0.0
+    assert compute_relative_error(diff, reference) == 0.0
 
 
-def test_compute_relative_error_handles_datetime_arrays():
-    diff = np.array([np.timedelta64(1, "s")])
-    field = np.array([np.datetime64("2024-01-01T00:00:02.000000000")])
+def test_compute_relative_error_divides_by_the_reference():
+    # |diff| / |reference| is 2/4 and 1/8; dividing by the comparison (2 and 7) would give 1.0.
+    reference = np.array([4.0, 8.0])
+    comparison = np.array([2.0, 7.0])
 
-    assert compute_relative_error(diff, field) == 0.0
+    assert compute_relative_error(reference - comparison, reference) == 0.5
+
+
+def test_compute_relative_error_ignores_points_that_do_not_differ():
+    # 0 - 0 and NaN (missing on either side) are left out instead of making the result NaN.
+    diff = np.array([0.0, np.nan, 1.0, np.nan])
+    reference = np.array([0.0, np.nan, 4.0, 2.0])
+
+    assert compute_relative_error(diff, reference) == 0.25
+
+
+@pytest.mark.parametrize(
+    "diff",
+    [np.array([0.0, 0.0, np.nan]), np.array([np.nan, np.nan, np.nan])],
+)
+def test_compute_relative_error_is_zero_when_no_point_differs(diff):
+    reference = np.array([0.0, 0.0, np.nan])
+
+    assert compute_relative_error(diff, reference) == 0.0
+
+
+def test_compute_relative_error_is_inf_for_a_difference_over_a_zero_reference():
+    diff = np.array([1.0, 0.5])
+    reference = np.array([0.0, 2.0])
+
+    assert compute_relative_error(diff, reference) == np.inf
+
+
+@pytest.mark.parametrize(("comparison_seconds", "expected"), [(1, np.nan), (2, 0.0)])
+def test_compute_relative_error_has_none_for_dates(comparison_seconds, expected):
+    reference = np.array(["2024-01-01T00:00:02", "NaT"], dtype="datetime64[ns]")
+    comparison = np.array([f"2024-01-01T00:00:0{comparison_seconds}", "NaT"], dtype="datetime64[ns]")
+
+    result = compute_relative_error(reference - comparison, reference)
+
+    np.testing.assert_equal(result, expected)
+
+
+def test_compute_relative_error_divides_durations_into_a_plain_ratio():
+    reference = np.array([4, 10, 0], dtype="timedelta64[h]")
+    comparison = np.array([3, 10, 0], dtype="timedelta64[h]")
+
+    result = compute_relative_error(reference - comparison, reference)
+
+    assert result == 0.25
+    assert isinstance(result, float)
+
+
+def test_compute_relative_error_is_inf_for_a_duration_over_a_zero_reference():
+    reference = np.array([0, 4], dtype="timedelta64[s]")
+    comparison = np.array([1, 4], dtype="timedelta64[s]")
+
+    assert compute_relative_error(reference - comparison, reference) == np.inf
+
+
+def test_compute_relative_error_takes_the_absolute_value_of_an_integer_reference_in_float():
+    # abs(int8(-128)) overflows back to -128 in int8.
+    reference = np.array([-128, 10], dtype="int8")
+    diff = np.array([-64.0, 0.0])
+
+    assert compute_relative_error(diff, reference) == 0.5
+
+
+@pytest.mark.parametrize(
+    ("diff", "reference"),
+    [
+        (np.array([1.0, 0.0, np.nan]), np.array([0.0, 0.0, np.nan])),
+        (np.array([np.nan, np.nan]), np.array([np.nan, np.nan])),
+        (np.array([1e300]), np.array([1e-300])),
+        (np.array([1, 0], dtype="timedelta64[s]"), np.array([0, 0], dtype="timedelta64[s]")),
+        (np.array([1, 0], dtype="timedelta64[s]"), np.array(["2024-01-01", "NaT"], dtype="datetime64[s]")),
+    ],
+)
+def test_compute_relative_error_emits_no_runtime_warning(diff, reference):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        compute_relative_error(diff, reference)
+
+
+@pytest.mark.parametrize(
+    ("reference", "comparison", "expected"),
+    [
+        # Nothing differs in the first block; the largest ratio is in the second, and the
+        # smaller one in the last block must not replace it.
+        ([1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 10.0], [1.0, 2.0, 3.0, 2.0, 4.0, 4.0, 9.0], 0.5),
+        # A zero reference in the last, partial block.
+        ([1.0, 1.0, 1.0, 2.0, 0.0], [1.0, 1.0, 1.0, 1.0, 1.0], np.inf),
+        # inf/inf in a later block wins over an earlier finite ratio, as without blocks.
+        ([2.0, 1.0, 1.0, np.inf], [1.0, 1.0, 1.0, 1.0], np.nan),
+        # Points that differ only through NaN, in every block.
+        ([np.nan, 1.0, 1.0, np.nan, 2.0], [1.0, 1.0, 1.0, 1.0, 2.0], 0.0),
+    ],
+)
+def test_compute_relative_error_gives_the_same_maximum_block_by_block(monkeypatch, reference, comparison, expected):
+    reference, comparison = np.array(reference), np.array(comparison)
+    with np.errstate(invalid="ignore"):
+        diff = reference - comparison
+    whole = compute_relative_error(diff, reference)
+
+    monkeypatch.setattr("xdiff.comparators.netcdf.RELATIVE_ERROR_BLOCK_SIZE", 3)
+    blocked = compute_relative_error(diff.reshape(-1, 1), reference.reshape(-1, 1))
+
+    np.testing.assert_equal([whole, blocked], [expected, expected])
+
+
+def test_compute_relative_error_broadcasts_the_reference_like_a_division():
+    diff = np.array([[1.0, 2.0], [0.0, 3.0]])
+
+    assert compute_relative_error(diff, np.array([4.0, 6.0])) == 0.5
+
+
+def test_compare_variables_gives_durations_their_ratio_and_differences(tmp_path):
+    hours = np.array([6, 1, 2], dtype="timedelta64[h]").astype("timedelta64[ns]")
+    xr.Dataset({"duration": ("x", hours)}).to_netcdf(tmp_path / "ref.nc")
+    xr.Dataset({"duration": ("x", hours - np.array([3, 0, 0], dtype="timedelta64[h]"))}).to_netcdf(tmp_path / "cmp.nc")
+    # Read back through netCDF, as in a real run: xarray decodes the variable as timedelta64.
+    with xr.open_dataset(tmp_path / "ref.nc") as reference, xr.open_dataset(tmp_path / "cmp.nc") as comparison:
+        assert reference["duration"].dtype.kind == "m"
+        result = compare_variables(reference["duration"], comparison["duration"], "duration", last_time_step=False)
+        identical = compare_variables(reference["duration"], reference["duration"], "duration", last_time_step=False)
+
+    # numpy counts timedelta64 as an integer type; converting it to float like an integer
+    # made the ratio fail with "ufunc 'divide' cannot use operands with types float64 and m8[ns]".
+    assert result.description == "-"
+    assert result.relative_error == 0.5
+    assert result.max_diff == np.timedelta64(3, "h")
+    assert result.min_diff == np.timedelta64(0, "h")
+    assert not result.passed
+    assert identical.passed
+
+
+@pytest.mark.parametrize("unit", ["s", "ms", "us", "ns"])
+def test_compare_variables_reports_durations_in_any_unit(unit):
+    # xarray reads durations back in the unit they were written in, e.g. pandas' [s].
+    hours = np.array([6, 1, 2], dtype="timedelta64[h]").astype(f"timedelta64[{unit}]")
+    reference = xr.DataArray(hours, dims="x")
+    comparison = xr.DataArray(hours - np.array([3, 0, 0], dtype="timedelta64[h]"), dims="x")
+
+    result = compare_variables(reference, comparison, "duration", last_time_step=False)
+    identical = compare_variables(reference, reference.copy(), "duration", last_time_step=False)
+
+    # float() of a timedelta64 coarser than ns gives a datetime.timedelta, so reading
+    # .passed used to raise and abort the run.
+    assert identical.passed
+    assert not result.passed
+    assert result.relative_error == 0.5
+    assert result.max_diff == np.timedelta64(3, "h")
+
+
+def test_compare_variables_divides_the_relative_error_by_the_reference():
+    reference = make_data_array([4.0, 8.0])
+    comparison = make_data_array([2.0, 7.0])
+
+    result = compare_variables(reference, comparison, "temp", last_time_step=False)
+
+    assert result.relative_error == 0.5
+
+
+def test_compare_variables_passes_identical_fields_of_zeros_and_nan():
+    # 0/0 at the zeros used to make the relative error NaN, which failed identical fields.
+    reference = make_data_array([0.0, 0.0, np.nan])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        result = compare_variables(reference, reference.copy(), "sea_ice", last_time_step=False)
+
+    assert result.passed
+    assert result.relative_error == 0.0
+
+
+def test_compare_variables_reports_inf_where_the_reference_is_zero():
+    reference = make_data_array([0.0, 2.0])
+    comparison = make_data_array([1.0, 2.0])
+
+    result = compare_variables(reference, comparison, "Cd", last_time_step=False)
+
+    assert result.relative_error == np.inf
+    assert not result.passed
 
 
 def test_compare_variables_returns_zeroed_result_for_identical_fields():
@@ -151,7 +323,7 @@ def test_compare_variables_allows_coordinate_value_mismatches():
 
     assert result.min_diff == 0.0
     assert result.max_diff == 1.0
-    assert result.relative_error == 0.5
+    assert result.relative_error == pytest.approx(1 / 3)
 
 
 def test_compare_variables_treats_matching_all_nan_fields_as_identical():
@@ -207,7 +379,7 @@ def test_compare_variables_does_not_wrap_around_on_unsigned_integers():
 
     assert result.min_diff == -5.0
     assert result.max_diff == 2.0
-    assert result.relative_error == pytest.approx(2 / 12)
+    assert result.relative_error == pytest.approx(2 / 10)
 
 
 @pytest.mark.parametrize(

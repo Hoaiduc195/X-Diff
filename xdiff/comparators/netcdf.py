@@ -523,11 +523,17 @@ def compare_variables(
     # silently corrupting min/max/relative-error. Promote integer operands to
     # float before subtracting; float and datetime/timedelta dtypes already
     # subtract correctly and are left untouched (the time path relies on the
-    # resulting timedelta64).
-    if np.issubdtype(reference_values.dtype, np.integer):
+    # resulting timedelta64). Test the kind, not np.integer: numpy counts timedelta64
+    # as an integer type, and converting durations to float broke their ratio.
+    if reference_values.dtype.kind in "iu":
         difference_field = reference_values.astype(np.float64) - comparison_values.astype(np.float64)
     else:
         difference_field = reference_values - comparison_values
+    if difference_field.dtype.kind == "m":
+        # A date or duration difference: keep it in nanoseconds. float() of a timedelta64 in
+        # a coarser unit (s, ms, us) returns a datetime.timedelta, which CompareResult.passed
+        # cannot turn into a number, and the run would abort.
+        difference_field = difference_field.astype("timedelta64[ns]")
 
     mask_is_equal = np.array_equal(reference_masked.mask, comparison_masked.mask)
 
@@ -565,7 +571,7 @@ def compare_variables(
         )
 
     return CompareResult(
-        relative_error=compute_relative_error(difference_field, comparison_values),
+        relative_error=compute_relative_error(difference_field, reference_values),
         min_diff=np.nanmin(difference_field),
         max_diff=np.nanmax(difference_field),
         mask_equal=mask_is_equal,
@@ -592,31 +598,74 @@ def find_time_dims_name(dims: Iterable) -> Any | None:
     return time_dimensions.pop()
 
 
-def compute_relative_error(diff: np.ndarray, field2: np.ndarray):
-    if np.all(diff == 0.0):
-        return 0.0
+# Points per block in compute_relative_error. Its float64 temporaries stay at about 2 MB
+# whatever the size of the field, and small enough to stay in the CPU cache: measured on
+# 50M points, 2**16 was faster than 2**20 and 2**14.
+RELATIVE_ERROR_BLOCK_SIZE = 1 << 16
 
-    if is_time_dtype(field2.dtype):
-        field2_values = field2.view("int64")
-    else:
-        field2_values = field2
 
-    abs_diff = np.abs(diff)
-    abs_field2 = np.abs(field2_values)
+def compute_relative_error(diff: np.ndarray, field2: np.ndarray) -> float:
+    """The maximum relative error ``|diff| / |field2|``, where ``field2`` is the reference field.
 
-    try:
-        with np.errstate(divide="ignore", invalid="ignore"):
-            rel_err_array = abs_diff / abs_field2
-            if np.isinf(rel_err_array).any():
-                rel_err_array[np.isinf(rel_err_array)] = np.nan
-            rel_err = np.nanmax(rel_err_array)
-    except Exception as exc:
-        logger.debug("An error occurred when computing relative error: %s", exc)
-        rel_err = np.nan
+    ``diff`` is the difference (reference minus comparison) and ``field2`` the reference,
+    broadcast to the shape of ``diff``. Only points that differ count: a point whose
+    difference is 0 (equal values, two zeros included) or NaN (missing on either side) is
+    left out, and the result is 0.0 when no point differs. A difference where the reference
+    is 0 gives ``inf``. Dates (datetime64) have no relative error: NaN when they differ, 0.0
+    when they do not. Durations (timedelta64) give the plain ratio of the two durations.
+    """
+    diff = np.asarray(diff)
+    reference = np.broadcast_to(np.asarray(field2), diff.shape)
+    if np.issubdtype(reference.dtype, np.datetime64):
+        # A date has no zero to measure an error against.
+        return np.nan if _differs(diff).any() else 0.0
 
-    if is_time_dtype(field2.dtype):
-        return rel_err / np.timedelta64(1, "s")
-    return rel_err
+    flat_diff = diff.reshape(-1)
+    flat_reference = reference.reshape(-1)
+    result = 0.0
+    # The errstate silences a difference over a zero reference (inf), inf/inf and overflow.
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        for start in range(0, flat_diff.size, RELATIVE_ERROR_BLOCK_SIZE):
+            block = slice(start, start + RELATIVE_ERROR_BLOCK_SIZE)
+            block_diff = flat_diff[block]
+            differs = _differs(block_diff)
+            if not differs.any():
+                continue
+            ratios = _magnitude(block_diff) / _magnitude(flat_reference[block])
+            if block_diff.dtype.kind != "m" and np.isinf(block_diff).any():
+                # inf/inf gives NaN at a point that differs, so only a masked maximum
+                # keeps it apart from the NaN of points that do not.
+                block_max = float(ratios.max(where=differs, initial=0.0))
+            else:
+                # A point that does not differ gives 0 (0/|ref|) or NaN (0/0, a missing
+                # value), and fmax skips NaN: the same maximum as one masked to the points
+                # that differ, without the masked reduction's cost on scattered points.
+                block_max = float(np.fmax.reduce(ratios, initial=0.0))
+            if np.isnan(block_max):
+                return np.nan  # inf/inf: an infinite reference against a finite comparison
+            result = max(result, block_max)
+    return result
+
+
+def _differs(diff: np.ndarray) -> np.ndarray:
+    """True where the difference is neither 0 nor NaN (a value missing on either side)."""
+    differs = diff != 0
+    differs &= ~np.isnan(diff)
+    return differs
+
+
+def _magnitude(values: np.ndarray) -> np.ndarray:
+    """``|values|`` as float64, or as durations for timedelta64.
+
+    Integers are converted before taking the absolute value, which overflows for them
+    (``abs(int8(-128))`` is ``-128``), and complex values are widened to complex128 first.
+    Dividing two durations already gives a float64 ratio.
+    """
+    if np.issubdtype(values.dtype, np.timedelta64):
+        return np.abs(values)
+    if np.iscomplexobj(values):
+        return np.abs(values.astype(np.complex128, copy=False))
+    return np.abs(values, dtype=np.float64)
 
 
 def is_time_dtype(dtype) -> bool:
