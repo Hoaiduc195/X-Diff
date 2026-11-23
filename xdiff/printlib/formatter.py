@@ -5,6 +5,7 @@ from typing import Any
 import numpy as np
 from rich import box
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -74,7 +75,7 @@ def print_comparison(comparison: Comparison, console: Console | None = None) -> 
         table.add_column(column)
 
     if comparison.exception is not None:
-        table.add_row(FAILED, "-", "-", "-", "-", "-", str(comparison.exception))
+        table.add_row(FAILED, "-", "-", "-", "-", "-", escape(str(comparison.exception)))
     elif len(comparison) == 0:
         table.add_row(FAILED, "-", "-", "-", "-", "-", "No comparable variables were selected")
     else:
@@ -86,8 +87,8 @@ def print_comparison(comparison: Comparison, console: Console | None = None) -> 
                 render(c.max_diff),
                 render(c.relative_error),
                 render(c.mask_equal),
-                render(c.variable),
-                render(result_detail(c)),
+                escape(render(c.variable)),
+                escape(render(result_detail(c))),
             )
 
     console.print(table)
@@ -146,11 +147,11 @@ def render_failed_comparisons_table(failed_comparisons: list[Comparison]) -> Tab
 
     for comparison in failed_comparisons:
         table.add_row(
-            str(comparison.reference_file or "-"),
-            str(comparison.comparison_file or "-"),
+            escape(str(comparison.reference_file or "-")),
+            escape(str(comparison.comparison_file or "-")),
             f"{comparison_failed_check_count(comparison)}/{comparison_total_check_count(comparison)}",
             comparison_failure_type(comparison),
-            comparison_failure_details(comparison),
+            escape(comparison_failure_details(comparison)),
         )
 
     return table
@@ -165,8 +166,8 @@ def build_comparison_title(comparison: Comparison) -> str:
             f"{comparison_failed_check_count(comparison)}/{comparison_total_check_count(comparison)} failed checks"
         )
 
-    reference = comparison.reference_file or "-"
-    target = comparison.comparison_file or "-"
+    reference = escape(str(comparison.reference_file or "-"))
+    target = escape(str(comparison.comparison_file or "-"))
     return f"{comparison_status_label(comparison)} {reference} vs {target} [dim]({check_summary})[/dim]"
 
 

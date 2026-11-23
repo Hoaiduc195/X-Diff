@@ -275,3 +275,43 @@ def test_an_error_on_a_one_sided_comparison_is_not_labelled_as_a_missing_file():
 
     assert formatter.comparison_status_label(failed) == "[red]ERROR[/red]"
     assert formatter.comparison_failure_type(failed) == "Error"
+
+
+def test_rich_report_preserves_bracketed_paths_variables_and_descriptions():
+    from io import StringIO
+    from rich.console import Console
+
+    comparison = Comparison(
+        reference_artifact=Artifact.from_path(Path("exp[ctrl]/a.nc")),
+        comparison_artifact=Artifact.from_path(Path("exp[test]/a.nc")),
+        compare_results=[
+            CompareResult(
+                variable="temp[degC]",
+                description="Data type mismatch: 'timedelta64[s]' - 'timedelta64[ns]'",
+            )
+        ],
+    )
+    errored = Comparison(
+        reference_artifact=Artifact.from_path(Path("err[1]/b.nc")),
+        comparison_artifact=Artifact.from_path(Path("err[2]/b.nc")),
+        exception=RuntimeError("bad [tag] value"),
+    )
+
+    buf = StringIO()
+    console = Console(file=buf, force_terminal=False, width=200)
+    formatter.print_comparison(comparison, console=console)
+    formatter.print_comparison(errored, console=console)
+    console.print(formatter.render_failed_comparisons_table([comparison, errored]))
+
+    rendered = buf.getvalue()
+    for expected in (
+        "exp[ctrl]/a.nc",
+        "exp[test]/a.nc",
+        "temp[degC]",
+        "timedelta64[s]",
+        "timedelta64[ns]",
+        "err[1]/b.nc",
+        "err[2]/b.nc",
+        "bad [tag] value",
+    ):
+        assert expected in rendered
