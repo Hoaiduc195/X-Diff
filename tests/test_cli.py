@@ -514,3 +514,19 @@ def test_files_compares_boolean_variables(tmp_path, comparison_flags, exit_code,
     # Identical flags used to fail with numpy's "boolean subtract is not supported", exit 1.
     assert result.exit_code == exit_code
     assert text in result.output
+
+
+def test_dirs_command_rejects_invalid_common_pattern(tmp_path):
+    # Issue #102: an invalid --common-pattern used to abort mid-run with an
+    # uncaught re.PatternError (exit 1 via traceback), or pass silently when
+    # every file paired by relative path or name. It is now a usage error.
+    (tmp_path / "ref").mkdir()
+    (tmp_path / "cmp").mkdir()
+    (tmp_path / "ref" / "same.nc").touch()
+    (tmp_path / "cmp" / "same.nc").touch()
+
+    result = CliRunner().invoke(cli, ["dirs", str(tmp_path / "ref"), str(tmp_path / "cmp"), "--common-pattern", "("])
+
+    assert result.exit_code == 2
+    assert "--common-pattern" in result.output
+    assert "unterminated subpattern" in result.output
